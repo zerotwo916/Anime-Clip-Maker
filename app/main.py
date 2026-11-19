@@ -300,15 +300,18 @@ def remaining_segments(duration: float, removed: List[Tuple[float, float]]) -> L
 
 
 def render_clip(source: Path, start: float, length: float, target: Path) -> None:
-    # "superfast" is a practical speed/quality compromise for CPU-only hosts.
-    # CRF 20 keeps the existing visual-quality target; output files may be larger.
+    # Limit encoder parallelism to reduce peak RAM use on small Railway containers.
+    # "ultrafast" avoids expensive motion estimation and is substantially lighter
+    # than superfast; CRF 20 preserves the configured quality target.
     run_command([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-threads", "2",
         "-ss", f"{start:.3f}", "-i", str(source), "-t", f"{length:.3f}",
         "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
-        "-c:v", "libx264", "-preset", "superfast", "-crf", "20", "-threads", "0",
-        "-c:a", "aac", "-b:a", "192k",
-        "-max_muxing_queue_size", "2048", str(target)
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+        "-threads", "2",
+        "-c:a", "aac", "-b:a", "128k", "-threads:a", "1",
+        "-max_muxing_queue_size", "1024", str(target)
     ])
 
 
