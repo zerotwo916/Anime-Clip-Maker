@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anime Clip Maker</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#10131c;color:#f4f5fb}
+*{box-sizing:border-box}body{margin:0;padding:20px;background:radial-gradient(circle at top,#252b43,#10131c 58%);min-height:100vh}
+main{max-width:760px;margin:28px auto;background:#1a1f2e;border:1px solid #343b50;border-radius:22px;padding:26px;box-shadow:0 20px 60px #0005}
+h1{margin:0 0 8px;font-size:clamp(27px,5vw,38px)}p{color:#b9c1d4;line-height:1.55}
+label{display:block;font-weight:650;margin:18px 0 8px}
+input,select{width:100%;padding:13px;border-radius:10px;border:1px solid #48516a;background:#111725;color:#fff;font:inherit}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+button{margin-top:22px;width:100%;padding:15px;border:0;border-radius:12px;background:#8065ee;color:white;font-weight:750;font-size:16px}
+button:disabled{opacity:.55}.hint{color:#9da8bf;font-size:13px}
+.notice{background:#29263c;border-left:3px solid #a28aff;padding:12px 14px;border-radius:8px;margin:18px 0}
+#status{margin-top:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:560px){body{padding:10px}main{padding:18px;margin:12px auto}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<h1>🎬 Anime Clip Maker</h1>
+<p>Remove selected opening/ending time ranges and split the remaining episode into clips.</p>
+<div class="notice"><b>Note:</b> Automatic AI OP/ED detection is not available yet. Enter the time ranges manually below.</div>
+<form id="maker">
+<label for="video">Anime video file</label>
+<input id="video" type="file" name="file" accept="video/*,.mkv,.mp4,.avi,.mov" required>
+<div class="grid">
+<div><label for="clip_seconds">Clip duration (seconds)</label><input id="clip_seconds" type="number" name="clip_seconds" min="10" max="3600" value="90" required></div>
+<div><label for="formats">Output format</label><select id="formats"><option value="mp4">MP4</option><option value="mkv">MKV</option><option value="mp4,mkv">Both (ZIP)</option></select></div>
+</div>
+<label for="opening">Opening ranges (optional)</label>
+<input id="opening" name="opening" placeholder="Example: 80-165, 900-985">
+<p class="hint">Enter start-end times in seconds. Separate multiple ranges with commas.</p>
+<label for="ending">Ending ranges (optional)</label>
+<input id="ending" name="ending" placeholder="Example: 1320-1410">
+<p class="hint">Only the ranges entered above are removed. Leave blank to keep that section.</p>
+<button id="submit" type="submit">Create clips and download ZIP</button>
+</form>
+<div id="status" role="status" aria-live="polite"></div>
+<p class="hint">Keep this page open while processing. Large uploads may exceed free-host CPU, memory, storage or timeout limits. Video is re-encoded to H.264/AAC.</p>
+</main>
+<script>
+const form=document.getElementById('maker');
+const statusBox=document.getElementById('status');
+const button=document.getElementById('submit');
+form.addEventListener('submit',async event=>{
+ event.preventDefault();
+ const data=new FormData(form);
+ const file=data.get('file');
+ if(!file||!file.size){statusBox.textContent='Please select a video file.';return;}
+ data.set('formats',document.getElementById('formats').value);
+ button.disabled=true;
+ statusBox.textContent='Uploading and processing… Keep this page open. Large videos can take a while.';
+ try{
+  const response=await fetch('/api/process',{method:'POST',body:data});
+  if(!response.ok){
+   let message='Processing failed.';
+   try{const result=await response.json();message=result.detail||message;}catch{}
+   throw new Error(message);
+  }
+  const blob=await response.blob();
+  const url=URL.createObjectURL(blob);
+  const link=document.createElement('a');
+  link.href=url;link.download='anime_clips.zip';
+  document.body.appendChild(link);link.click();link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),60000);
+  statusBox.textContent='Finished! Your ZIP download should have started.';
+ }catch(error){
+  statusBox.textContent='Error: '+error.message;
+ }finally{
+  button.disabled=false;
+ }
+});
+</script>
+</body>
+</html>
