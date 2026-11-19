@@ -273,13 +273,24 @@ def remaining_segments(duration: float, removed: List[Tuple[float, float]]) -> L
 
 
 def render_clip(source: Path, start: float, length: float, target: Path) -> None:
+    # "superfast" is a practical speed/quality compromise for CPU-only hosts.
+    # CRF 20 keeps the existing visual-quality target; output files may be larger.
     run_command([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{start:.3f}", "-i", str(source), "-t", f"{length:.3f}",
         "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:v", "libx264", "-preset", "superfast", "-crf", "20", "-threads", "0",
         "-c:a", "aac", "-b:a", "192k",
         "-max_muxing_queue_size", "2048", str(target)
+    ])
+
+
+def remux_clip(source: Path, target: Path) -> None:
+    # H.264/AAC can be placed in MP4 without encoding the streams a second time.
+    run_command([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+        "-c", "copy", "-movflags", "+faststart", str(target)
     ])
 
 
@@ -416,7 +427,15 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
             cursor = segment_start
             while cursor < segment_end - 0.05:
                 clip_length = min(float(clip_seconds), segment_end - cursor)
-                for extension in selected_formats:
+                if len(selected_formats) == 2:
+                    # Encode once to MKV, then create the MP4 by stream-copy remux.
+                    mkv_output = folder / f"clip_{clip_index:03d}.mkv"
+                    mp4_output = folder / f"clip_{clip_index:03d}.mp4"
+                    render_clip(source, cursor, clip_length, mkv_output)
+                    remux_clip(mkv_output, mp4_output)
+                    created.extend([mp4_output, mkv_output])
+                else:
+                    extension = selected_formats[0]
                     output = folder / f"clip_{clip_index:03d}.{extension}"
                     render_clip(source, cursor, clip_length, output)
                     created.append(output)
