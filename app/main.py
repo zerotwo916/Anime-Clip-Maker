@@ -283,6 +283,27 @@ def render_clip(source: Path, start: float, length: float, target: Path) -> None
     ])
 
 
+@app.on_event("startup")
+async def mark_interrupted_jobs():
+    # In-process background work cannot survive a container restart.
+    # Mark unfinished jobs clearly instead of leaving them stuck at "processing".
+    for folder in DATA_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        metadata_path = folder / "job.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("status") in {"queued", "processing"}:
+                metadata.update({
+                    "status": "failed",
+                    "message": "The server restarted before this job finished. Please start it again.",
+                    "error": "Server restarted; in-process background jobs cannot resume automatically."
+                })
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
