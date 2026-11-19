@@ -25,11 +25,14 @@ button:disabled{opacity:.55}.hint{color:#9da8bf;font-size:13px}
 <p>Remove selected opening/ending time ranges and split the remaining episode into clips.</p>
 <div class="notice"><b>Note:</b> Automatic AI OP/ED detection is not available yet. Enter the time ranges manually below.</div>
 <form id="maker">
-<label for="video">Upload video file (optional if using Gofile)</label>
+<label for="video">Upload video file (optional if using a share link)</label>
 <input id="video" type="file" name="file" accept="video/*,.mkv,.mp4,.avi,.mov,.webm">
 <label for="video_url">Or paste a public Gofile share link</label>
 <input id="video_url" type="url" name="video_url" placeholder="https://gofile.io/d/SHARE_CODE">
-<p class="hint">Use a public Gofile folder containing exactly one MP4/MKV/video file. Password-protected or expired links may not work.</p>
+<p class="hint">Use a public Gofile share containing one video. Password-protected or expired links may not work.</p>
+<label for="mega_url">Or paste a public MEGA file link</label>
+<input id="mega_url" type="url" name="mega_url" placeholder="https://mega.nz/file/FILE_ID#FILE_KEY">
+<p class="hint">Paste the complete MEGA link, including the key after #. Public single-file links are supported.</p>
 <div class="grid">
 <div><label for="clip_seconds">Clip duration (seconds)</label><input id="clip_seconds" type="number" name="clip_seconds" min="10" max="3600" value="90" required></div>
 <div><label for="formats">Output format</label><select id="formats"><option value="mp4">MP4</option><option value="mkv">MKV</option><option value="mp4,mkv">Both (ZIP)</option></select></div>
@@ -54,10 +57,11 @@ form.addEventListener('submit',async event=>{
  const data=new FormData(form);
  const file=document.getElementById('video').files[0];
  const link=document.getElementById('video_url').value.trim();
- if(Boolean(file)===Boolean(link)){statusBox.textContent='Choose either a video file or a Gofile share link.';return;}
+ const megaLink=document.getElementById('mega_url').value.trim();
+ if([Boolean(file),Boolean(link),Boolean(megaLink)].filter(Boolean).length!==1){statusBox.textContent='Choose exactly one source: a video file, a Gofile link, or a MEGA link.';return;}
  data.set('formats',document.getElementById('formats').value);
  button.disabled=true;
- statusBox.textContent=link?'Fetching video from Gofile and processing… Keep this page open.':'Uploading and processing… Keep this page open.';
+ statusBox.textContent=megaLink?'Downloading video from MEGA and processing… Keep this page open.':link?'Fetching video from Gofile and processing… Keep this page open.':'Uploading and processing… Keep this page open.';
  try{
   const response=await fetch('/api/process',{method:'POST',body:data});
   if(!response.ok){let message='Processing failed.';try{const result=await response.json();message=result.detail||message;}catch{}throw new Error(message);}
