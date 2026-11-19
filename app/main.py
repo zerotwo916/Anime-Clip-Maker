@@ -1,17 +1,22 @@
 import hashlib
+import json
+import os
+import re
+import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import urlparse
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -288,8 +293,142 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/api/process")
-async def process_video(
+
+# Jobs are stored on Railway's persistent volume when /data is mounted.
+# Without a volume, /tmp is used and jobs are lost if the container restarts.
+DATA_DIR = Path(os.getenv("JOBS_DIR", "/data/anime-clip-jobs" if Path("/data").is_dir() else str(Path(tempfile.gettempdir()) / "anime-clip-jobs")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{24,80}$")
+JOB_LOCK = threading.Lock()
+MAX_JOB_AGE_SECONDS = 24 * 60 * 60
+
+
+def job_path(job_id: str) -> Path:
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return DATA_DIR / job_id
+
+
+def write_job(job_id: str, **updates):
+    folder = job_path(job_id)
+    metadata_path = folder / "job.json"
+    with JOB_LOCK:
+        current = {}
+        if metadata_path.exists():
+            try:
+                current = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                current = {}
+        current.update(updates)
+        temporary = metadata_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(current), encoding="utf-8")
+        temporary.replace(metadata_path)
+
+
+def read_job(job_id: str):
+    folder = job_path(job_id)
+    metadata_path = folder / "job.json"
+    if not metadata_path.is_file():
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(status_code=500, detail="Could not read job status.")
+
+
+def cleanup_old_jobs():
+    now = time.time()
+    for folder in DATA_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        try:
+            metadata = json.loads((folder / "job.json").read_text(encoding="utf-8"))
+            created = float(metadata.get("created_at", now))
+            if now - created > MAX_JOB_AGE_SECONDS:
+                shutil.rmtree(folder, ignore_errors=True)
+        except (OSError, ValueError, TypeError):
+            # Leave incomplete/unreadable folders alone rather than deleting user data.
+            continue
+
+
+def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
+                clip_seconds: int, selected_formats: list, opening: str, ending: str):
+    folder = job_path(job_id)
+    try:
+        write_job(job_id, status="processing", message="Preparing video…", progress=0)
+        if source_kind in {"gofile", "mega"}:
+            downloaded_file = folder / "source_video"
+            if source_kind == "mega":
+                filename = download_mega_video(mega_url, downloaded_file)
+            else:
+                filename = download_gofile_video(video_url, downloaded_file)
+            suffix = Path(filename).suffix.lower()
+            if suffix not in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
+                raise HTTPException(status_code=422, detail="The shared item is not a supported video.")
+            source = folder / ("source" + suffix)
+            downloaded_file.replace(source)
+        else:
+            source = folder / "source_upload"
+            if not source.is_file() or source.stat().st_size == 0:
+                raise HTTPException(status_code=422, detail="Uploaded video is missing or empty.")
+
+        duration = get_duration(source)
+        removed = merge_ranges(parse_ranges(opening, duration) + parse_ranges(ending, duration))
+        segments = remaining_segments(duration, removed)
+        if not segments:
+            raise HTTPException(status_code=400, detail="The selected ranges remove the entire video.")
+
+        clip_count = 0
+        for segment_start, segment_end in segments:
+            remaining = segment_end - segment_start
+            clip_count += int(remaining // clip_seconds)
+            if remaining % clip_seconds > 0.05:
+                clip_count += 1
+        if clip_count <= 0:
+            raise HTTPException(status_code=400, detail="No clips could be created.")
+        write_job(job_id, message=f"Creating clips (0/{clip_count})…", progress=0, total=clip_count)
+
+        created = []
+        clip_index = 1
+        completed = 0
+        for segment_start, segment_end in segments:
+            cursor = segment_start
+            while cursor < segment_end - 0.05:
+                clip_length = min(float(clip_seconds), segment_end - cursor)
+                for extension in selected_formats:
+                    output = folder / f"clip_{clip_index:03d}.{extension}"
+                    render_clip(source, cursor, clip_length, output)
+                    created.append(output)
+                cursor += clip_length
+                clip_index += 1
+                completed += 1
+                write_job(job_id, message=f"Creating clips ({completed}/{clip_count})…",
+                          progress=round(completed * 100 / clip_count), total=clip_count)
+
+        archive = folder / "anime_clips.zip"
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for output in created:
+                zip_file.write(output, arcname=output.name)
+        write_job(job_id, status="completed", message="Clips are ready to download.",
+                  progress=100, total=clip_count, download_url=f"/api/jobs/{job_id}/download")
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc) or "Unknown processing error."
+        write_job(job_id, status="failed", message="Processing failed.", error=str(detail)[:3000])
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/jobs")
+async def create_job(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(None),
     video_url: str = Form(""),
     mega_url: str = Form(""),
@@ -300,65 +439,69 @@ async def process_video(
 ):
     if clip_seconds < 10 or clip_seconds > 3600:
         raise HTTPException(status_code=400, detail="Clip duration must be between 10 and 3600 seconds.")
-    selected_formats = {part.strip().lower() for part in formats.split(",") if part.strip()}
-    if not selected_formats or not selected_formats.issubset({"mp4", "mkv"}):
+    selected_formats = sorted({part.strip().lower() for part in formats.split(",") if part.strip()})
+    if not selected_formats or not set(selected_formats).issubset({"mp4", "mkv"}):
         raise HTTPException(status_code=400, detail="Choose MP4, MKV, or both.")
     has_file = file is not None and bool(file.filename)
     has_url = bool(video_url.strip())
     has_mega_url = bool(mega_url.strip())
     if sum((has_file, has_url, has_mega_url)) != 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Choose exactly one source: upload a video, a Gofile share link, or a MEGA file link.",
-        )
+        raise HTTPException(status_code=400, detail="Choose exactly one source: upload a video, a Gofile share link, or a MEGA file link.")
+    if has_url:
+        gofile_share_code(video_url)
+    if has_mega_url:
+        mega_share_url(mega_url)
 
-    job_dir = Path(tempfile.mkdtemp(prefix="anime-clip-"))
-    try:
-        if has_url or has_mega_url:
-            downloaded_file = job_dir / "source_video"
-            if has_mega_url:
-                filename = download_mega_video(mega_url, downloaded_file)
-            else:
-                filename = download_gofile_video(video_url, downloaded_file)
-            suffix = Path(filename).suffix.lower()
-            if suffix not in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
-                raise HTTPException(status_code=422, detail="The shared item is not a supported video.")
-            source = job_dir / ("source" + suffix)
-            downloaded_file.replace(source)
-        else:
-            suffix = Path(file.filename).suffix.lower() or ".mp4"
-            source = job_dir / ("source" + suffix)
-            await save_upload(file, source)
+    cleanup_old_jobs()
+    job_id = secrets.token_urlsafe(32)
+    folder = DATA_DIR / job_id
+    folder.mkdir(parents=True, exist_ok=False)
+    source_kind = "upload" if has_file else ("mega" if has_mega_url else "gofile")
+    write_job(job_id, status="queued", message="Job queued.", progress=0, total=0,
+              created_at=time.time(), source_kind=source_kind)
 
-        duration = get_duration(source)
-        removed = merge_ranges(parse_ranges(opening, duration) + parse_ranges(ending, duration))
-        segments = remaining_segments(duration, removed)
-        if not segments:
-            raise HTTPException(status_code=400, detail="The selected ranges remove the entire video.")
+    # Finish receiving an uploaded file before returning the job ID. Once this
+    # completes, leaving the page does not cancel the server-side processing.
+    if has_file:
+        suffix = Path(file.filename).suffix.lower() or ".mp4"
+        if suffix not in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise HTTPException(status_code=422, detail="Unsupported video format.")
+        try:
+            await save_upload(file, folder / "source_upload")
+        except Exception:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        finally:
+            await file.close()
 
-        created = []
-        clip_index = 1
-        for segment_start, segment_end in segments:
-            cursor = segment_start
-            while cursor < segment_end - 0.05:
-                clip_length = min(float(clip_seconds), segment_end - cursor)
-                for extension in sorted(selected_formats):
-                    output = job_dir / f"clip_{clip_index:03d}.{extension}"
-                    render_clip(source, cursor, clip_length, output)
-                    created.append(output)
-                cursor += clip_length
-                clip_index += 1
+    background_tasks.add_task(
+        process_job, job_id, source_kind, video_url.strip(), mega_url.strip(),
+        clip_seconds, selected_formats, opening, ending
+    )
+    return {"job_id": job_id, "status": "queued", "message": "Job started."}
 
-        archive = job_dir / "anime_clips.zip"
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-            for output in created:
-                zip_file.write(output, arcname=output.name)
-        return FileResponse(
-            path=archive,
-            media_type="application/zip",
-            filename="anime_clips.zip",
-            background=BackgroundTask(shutil.rmtree, job_dir, ignore_errors=True)
-        )
-    except Exception:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        raise
+
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    metadata = read_job(job_id)
+    return {
+        "job_id": job_id,
+        "status": metadata.get("status", "queued"),
+        "message": metadata.get("message", ""),
+        "progress": metadata.get("progress", 0),
+        "total": metadata.get("total", 0),
+        "error": metadata.get("error"),
+        "download_url": metadata.get("download_url")
+    }
+
+
+@app.get("/api/jobs/{job_id}/download")
+async def download_job(job_id: str):
+    metadata = read_job(job_id)
+    if metadata.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="This job is not ready yet.")
+    archive = job_path(job_id) / "anime_clips.zip"
+    if not archive.is_file():
+        raise HTTPException(status_code=404, detail="ZIP file is no longer available.")
+    return FileResponse(path=archive, media_type="application/zip", filename="anime_clips.zip")
