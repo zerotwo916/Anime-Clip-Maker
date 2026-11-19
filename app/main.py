@@ -159,6 +159,67 @@ def download_gofile_video(share_url: str, destination: Path) -> str:
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+
+def mega_share_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url.strip())
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"mega.nz", "www.mega.nz", "mega.co.nz", "www.mega.co.nz"}
+        or len([part for part in parsed.path.split("/") if part]) != 2
+        or [part for part in parsed.path.split("/") if part][0] != "file"
+        or not parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a complete public MEGA file link, including the key after #.",
+        )
+    return raw_url.strip()
+
+
+def download_mega_video(share_url: str, destination: Path) -> str:
+    url = mega_share_url(share_url)
+    try:
+        from mega_client import MegaClient, MegaClientError
+
+        with MegaClient() as client:
+            info = client.get_file_info(url)
+            filename = Path(info.name or "mega_video").name
+            suffix = Path(filename).suffix.lower()
+            if suffix not in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"MEGA file is not a supported video: {filename}",
+                )
+            if info.size and info.size > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="MEGA video is larger than the 2 GB app limit.",
+                )
+            result = client.download_file(url, str(destination), resume=False)
+            downloaded_path = Path(result.path) if getattr(result, "path", None) else destination
+            if downloaded_path != destination and downloaded_path.exists():
+                shutil.copy2(downloaded_path, destination)
+            if not destination.exists() or destination.stat().st_size == 0:
+                raise ValueError("MEGA download finished without creating a video file.")
+            if destination.stat().st_size > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="MEGA video is larger than the 2 GB app limit.",
+                )
+            return filename
+    except HTTPException:
+        raise
+    except MegaClientError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not download the MEGA video: {exc}",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not download the MEGA video: {exc}",
+        )
+
 def get_duration(path: Path) -> float:
     result = run_command([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -236,6 +297,7 @@ async def health():
 async def process_video(
     file: UploadFile = File(None),
     video_url: str = Form(""),
+    mega_url: str = Form(""),
     clip_seconds: int = Form(90),
     formats: str = Form("mp4"),
     opening: str = Form(""),
@@ -248,18 +310,26 @@ async def process_video(
         raise HTTPException(status_code=400, detail="Choose MP4, MKV, or both.")
     has_file = file is not None and bool(file.filename)
     has_url = bool(video_url.strip())
-    if has_file == has_url:
-        raise HTTPException(status_code=400, detail="Choose either a video file or one Gofile share link, not both.")
+    has_mega_url = bool(mega_url.strip())
+    if sum((has_file, has_url, has_mega_url)) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose exactly one source: upload a video, a Gofile share link, or a MEGA file link.",
+        )
 
     job_dir = Path(tempfile.mkdtemp(prefix="anime-clip-"))
     try:
-        if has_url:
-            filename = download_gofile_video(video_url, job_dir / "source_video")
+        if has_url or has_mega_url:
+            downloaded_file = job_dir / "source_video"
+            if has_mega_url:
+                filename = download_mega_video(mega_url, downloaded_file)
+            else:
+                filename = download_gofile_video(video_url, downloaded_file)
             suffix = Path(filename).suffix.lower()
             if suffix not in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
-                raise HTTPException(status_code=422, detail="The Gofile item is not a supported video.")
+                raise HTTPException(status_code=422, detail="The shared item is not a supported video.")
             source = job_dir / ("source" + suffix)
-            (job_dir / "source_video").replace(source)
+            downloaded_file.replace(source)
         else:
             suffix = Path(file.filename).suffix.lower() or ".mp4"
             source = job_dir / ("source" + suffix)
