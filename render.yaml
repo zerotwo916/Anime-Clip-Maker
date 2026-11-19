@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: anime-clip-maker
+    runtime: docker
+    plan: free
+    healthCheckPath: /
