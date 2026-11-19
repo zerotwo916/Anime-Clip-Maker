@@ -200,19 +200,38 @@ def download_mega_video(share_url: str, destination: Path) -> str:
                     status_code=413,
                     detail="MEGA video is larger than the 2 GB app limit.",
                 )
-            result = client.download_file(url, str(destination), resume=False)
+            # Download into a dedicated staging path. Some client versions
+            # report the requested path as their result and then attempt a
+            # redundant copy; tolerate that only when a valid file exists.
+            try:
+                result = client.download_file(url, str(destination), resume=False)
+            except shutil.SameFileError:
+                if not destination.is_file() or destination.stat().st_size == 0:
+                    raise
+                result = None
+
             downloaded_path = Path(result.path) if getattr(result, "path", None) else destination
 
-            # Some MEGA client versions return the same downloaded file using
-            # a differently-normalized path. Avoid copying a file onto itself.
             same_file = False
             try:
-                same_file = downloaded_path.exists() and destination.exists() and os.path.samefile(downloaded_path, destination)
+                same_file = (
+                    downloaded_path.exists()
+                    and destination.exists()
+                    and (
+                        downloaded_path == destination
+                        or downloaded_path.resolve() == destination.resolve()
+                        or os.path.samefile(downloaded_path, destination)
+                    )
+                )
             except OSError:
-                same_file = False
-            if not same_file and downloaded_path.exists():
-                if downloaded_path.resolve() != destination.resolve():
+                same_file = downloaded_path == destination
+            if downloaded_path.exists() and not same_file:
+                try:
                     shutil.copy2(downloaded_path, destination)
+                except shutil.SameFileError:
+                    # A path alias can still resolve to the same underlying file.
+                    if not destination.is_file() or destination.stat().st_size == 0:
+                        raise
 
             if not destination.is_file() or destination.stat().st_size == 0:
                 # Some versions create the file inside a directory named as
