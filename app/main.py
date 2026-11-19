@@ -183,8 +183,15 @@ def mega_share_url(raw_url: str) -> str:
 
 def download_mega_video(share_url: str, destination: Path) -> str:
     url = mega_share_url(share_url)
+    staging_dir = destination.parent / (destination.name + "_mega_staging")
     try:
         from mega_client import MegaClient
+
+        # mega-public-client expects a DIRECTORY for normal downloads.
+        # Passing the old extensionless destination path caused its internal
+        # path handling to treat the output as both source and destination.
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        staging_dir.mkdir(parents=True, exist_ok=True)
 
         with MegaClient() as client:
             info = client.get_file_info(url)
@@ -198,69 +205,38 @@ def download_mega_video(share_url: str, destination: Path) -> str:
             if info.size and info.size > MAX_UPLOAD_BYTES:
                 raise HTTPException(
                     status_code=413,
-                    detail="MEGA video is larger than the 2 GB app limit.",
+                    detail="MEGA video is larger than the app's 2 GB limit.",
                 )
-            # Download into a dedicated staging path. Some client versions
-            # report the requested path as their result and then attempt a
-            # redundant copy; tolerate that only when a valid file exists.
-            try:
-                result = client.download_file(url, str(destination), resume=False)
-            except shutil.SameFileError:
-                if not destination.is_file() or destination.stat().st_size == 0:
-                    raise
-                result = None
 
-            downloaded_path = Path(result.path) if getattr(result, "path", None) else destination
+            result = client.download_file(url, str(staging_dir), resume=False)
+            downloaded_path = Path(result.path) if getattr(result, "path", None) else staging_dir / filename
 
-            same_file = False
-            try:
-                same_file = (
-                    downloaded_path.exists()
-                    and destination.exists()
-                    and (
-                        downloaded_path == destination
-                        or downloaded_path.resolve() == destination.resolve()
-                        or os.path.samefile(downloaded_path, destination)
-                    )
-                )
-            except OSError:
-                same_file = downloaded_path == destination
-            if downloaded_path.exists() and not same_file:
-                try:
-                    shutil.copy2(downloaded_path, destination)
-                except shutil.SameFileError:
-                    # A path alias can still resolve to the same underlying file.
-                    if not destination.is_file() or destination.stat().st_size == 0:
-                        raise
-
-            if not destination.is_file() or destination.stat().st_size == 0:
-                # Some versions create the file inside a directory named as
-                # the requested destination; locate the actual downloaded file.
-                candidates = []
-                if downloaded_path.is_file():
-                    candidates.append(downloaded_path)
-                if destination.is_dir():
-                    candidates.extend(p for p in destination.iterdir() if p.is_file())
-                actual = next((p for p in candidates if p.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm"}), None)
-                if actual is None:
-                    raise ValueError("MEGA download finished but the video file could not be located.")
-                if actual.resolve() != destination.resolve():
-                    shutil.copy2(actual, destination)
-            if not destination.is_file() or destination.stat().st_size == 0:
-                raise ValueError("MEGA download finished without creating a video file.")
-            if destination.stat().st_size > MAX_UPLOAD_BYTES:
+            if not downloaded_path.is_file() or downloaded_path.stat().st_size == 0:
+                raise ValueError("MEGA download finished but the downloaded video file is missing or empty.")
+            if downloaded_path.stat().st_size > MAX_UPLOAD_BYTES:
                 raise HTTPException(
                     status_code=413,
-                    detail="MEGA video is larger than the 2 GB app limit.",
+                    detail="MEGA video is larger than the app's 2 GB limit.",
                 )
+
+            # Move from a separate staging directory to the exact path
+            # expected by process_job; source and destination cannot be equal.
+            if destination.exists():
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            shutil.move(str(downloaded_path), str(destination))
             return filename
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Could not download the MEGA video: {exc}",
+            detail=f"Could not download the MEGA video: {type(exc).__name__}: {exc}",
         )
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 def get_duration(path: Path) -> float:
     result = run_command([
