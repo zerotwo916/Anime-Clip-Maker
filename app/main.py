@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 from pathlib import Path
 from typing import List, Tuple
@@ -35,7 +36,15 @@ def run_command(args: list[str]) -> subprocess.CompletedProcess:
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail="FFmpeg/FFprobe is missing on the server.")
     except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "Media processing failed")[-3000:]
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        command = " ".join(str(part) for part in args)
+        detail = stderr or stdout or "The media tool exited without returning an error message."
+        detail = (
+            f"Command: {command}\n"
+            f"Exit code: {exc.returncode}\n"
+            f"Output: {detail}"
+        )[-6000:]
         raise HTTPException(status_code=422, detail=detail)
 
 
@@ -471,7 +480,16 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
                   progress=100, total=clip_count, download_url=f"/api/jobs/{job_id}/download")
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc) or "Unknown processing error."
-        write_job(job_id, status="failed", message="Processing failed.", error=str(detail)[:3000])
+        diagnostic = (
+            f"{type(exc).__name__}: {detail}\n\n"
+            f"Diagnostic traceback:\n{traceback.format_exc()}"
+        )
+        write_job(
+            job_id,
+            status="failed",
+            message="Processing failed. See the diagnostic details below.",
+            error=diagnostic[-8000:]
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
