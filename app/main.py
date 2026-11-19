@@ -179,7 +179,7 @@ def mega_share_url(raw_url: str) -> str:
 def download_mega_video(share_url: str, destination: Path) -> str:
     url = mega_share_url(share_url)
     try:
-        from mega_client import MegaClient, MegaClientError
+        from mega_client import MegaClient
 
         with MegaClient() as client:
             info = client.get_file_info(url)
@@ -209,11 +209,6 @@ def download_mega_video(share_url: str, destination: Path) -> str:
             return filename
     except HTTPException:
         raise
-    except MegaClientError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not download the MEGA video: {exc}",
-        )
     except Exception as exc:
         raise HTTPException(
             status_code=502,
