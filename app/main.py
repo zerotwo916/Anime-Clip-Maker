@@ -1,10 +1,13 @@
+import hashlib
 import shutil
 import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
 from typing import List, Tuple
+from urllib.parse import urlparse
 
+import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +16,7 @@ from starlette.background import BackgroundTask
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+GOFILE_API = "https://api.gofile.io"
 
 app = FastAPI(title="Anime Clip Maker")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -44,6 +48,87 @@ async def save_upload(upload: UploadFile, destination: Path) -> int:
     return size
 
 
+def gofile_share_code(raw_url: str) -> str:
+    parsed = urlparse(raw_url.strip())
+    if parsed.scheme != "https" or parsed.hostname not in {"gofile.io", "www.gofile.io"}:
+        raise HTTPException(status_code=400, detail="Please enter a public https://gofile.io/d/ share link.")
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 2 or parts[0] != "d" or not parts[1].isalnum():
+        raise HTTPException(status_code=400, detail="Invalid Gofile share link. Expected https://gofile.io/d/SHARE_CODE.")
+    return parts[1]
+
+
+def download_gofile_video(share_url: str, destination: Path) -> str:
+    code = gofile_share_code(share_url)
+    session = requests.Session()
+    session.headers.update({"User-Agent": "AnimeClipMaker/1.0"})
+    try:
+        account_response = session.get(f"{GOFILE_API}/createAccount", timeout=(10, 30))
+        account_response.raise_for_status()
+        account_data = account_response.json().get("data", {})
+        token = account_data.get("token")
+        if not token:
+            raise ValueError("Gofile guest session could not be created.")
+
+        params = {
+            "contentId": code,
+            "token": token,
+            "websiteToken": "12345",
+            "cache": "true",
+            "password": hashlib.sha256(b"").hexdigest(),
+        }
+        content_response = session.get(f"{GOFILE_API}/getContent", params=params, timeout=(10, 45))
+        content_response.raise_for_status()
+        payload = content_response.json()
+        if payload.get("status") != "ok":
+            raise ValueError("Gofile could not open this share. It may be private, expired, or unavailable.")
+
+        contents = payload.get("data", {}).get("contents", {})
+        videos = []
+        for item in contents.values():
+            if item.get("type") != "file":
+                continue
+            name = Path(item.get("name") or "video").name
+            if Path(name).suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
+                link = item.get("directLink") or item.get("link")
+                if link:
+                    videos.append((name, link))
+
+        if not videos:
+            raise ValueError("No supported video file was found in this Gofile folder.")
+        if len(videos) > 1:
+            names = ", ".join(name for name, _ in videos[:8])
+            raise ValueError(f"More than one video was found ({names}). Please share a Gofile link containing only one video.")
+
+        filename, download_url = videos[0]
+        parsed_download = urlparse(download_url)
+        host = parsed_download.hostname or ""
+        if parsed_download.scheme != "https" or not (host == "gofile.io" or host.endswith(".gofile.io")):
+            raise ValueError("Gofile returned an unexpected download address.")
+
+        total = 0
+        with session.get(download_url, stream=True, timeout=(15, 90), allow_redirects=True) as response:
+            response.raise_for_status()
+            final_host = urlparse(response.url).hostname or ""
+            if urlparse(response.url).scheme != "https" or not (final_host == "gofile.io" or final_host.endswith(".gofile.io")):
+                raise ValueError("Gofile redirected to an unexpected download address.")
+            with destination.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_UPLOAD_BYTES:
+                        raise ValueError("Gofile video exceeds the app's 2 GB limit.")
+                    output.write(chunk)
+        if total == 0:
+            raise ValueError("Gofile returned an empty file.")
+        return filename
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Could not download the Gofile video: {exc}")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
 def get_duration(path: Path) -> float:
     result = run_command([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -67,15 +152,9 @@ def parse_ranges(raw: str, duration: float) -> List[Tuple[float, float]]:
             start_text, end_text = item.strip().split("-", 1)
             start, end = float(start_text.strip()), float(end_text.strip())
         except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid time range. Use seconds like 80-165, 1320-1410."
-            )
+            raise HTTPException(status_code=400, detail="Invalid time range. Use seconds like 80-165, 1320-1410.")
         if start < 0 or end <= start or end > duration:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid range '{item}'. Start/end must be within the video duration."
-            )
+            raise HTTPException(status_code=400, detail=f"Invalid range '{item}'. Start/end must be within the video duration.")
         parsed.append((start, end))
     return parsed
 
@@ -123,19 +202,10 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/api/probe")
-async def probe(file: UploadFile = File(...)):
-    suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
-    with tempfile.TemporaryDirectory(prefix="anime-probe-") as temp:
-        source = Path(temp) / ("upload" + suffix)
-        await save_upload(file, source)
-        duration = get_duration(source)
-    return {"duration": duration}
-
-
 @app.post("/api/process")
 async def process_video(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),
+    video_url: str = Form(""),
     clip_seconds: int = Form(90),
     formats: str = Form("mp4"),
     opening: str = Form(""),
@@ -143,20 +213,30 @@ async def process_video(
 ):
     if clip_seconds < 10 or clip_seconds > 3600:
         raise HTTPException(status_code=400, detail="Clip duration must be between 10 and 3600 seconds.")
-
     selected_formats = {part.strip().lower() for part in formats.split(",") if part.strip()}
     if not selected_formats or not selected_formats.issubset({"mp4", "mkv"}):
         raise HTTPException(status_code=400, detail="Choose MP4, MKV, or both.")
+    has_file = file is not None and bool(file.filename)
+    has_url = bool(video_url.strip())
+    if has_file == has_url:
+        raise HTTPException(status_code=400, detail="Choose either a video file or one Gofile share link, not both.")
 
     job_dir = Path(tempfile.mkdtemp(prefix="anime-clip-"))
-    source = job_dir / ("source" + (Path(file.filename or "video.mp4").suffix or ".mp4"))
-
     try:
-        await save_upload(file, source)
+        if has_url:
+            filename = download_gofile_video(video_url, job_dir / "source_video")
+            suffix = Path(filename).suffix.lower()
+            if suffix not in {".mp4", ".mkv", ".mov", ".avi", ".webm"}:
+                raise HTTPException(status_code=422, detail="The Gofile item is not a supported video.")
+            source = job_dir / ("source" + suffix)
+            (job_dir / "source_video").replace(source)
+        else:
+            suffix = Path(file.filename).suffix.lower() or ".mp4"
+            source = job_dir / ("source" + suffix)
+            await save_upload(file, source)
+
         duration = get_duration(source)
-        removed = merge_ranges(
-            parse_ranges(opening, duration) + parse_ranges(ending, duration)
-        )
+        removed = merge_ranges(parse_ranges(opening, duration) + parse_ranges(ending, duration))
         segments = remaining_segments(duration, removed)
         if not segments:
             raise HTTPException(status_code=400, detail="The selected ranges remove the entire video.")
@@ -178,7 +258,6 @@ async def process_video(
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
             for output in created:
                 zip_file.write(output, arcname=output.name)
-
         return FileResponse(
             path=archive,
             media_type="application/zip",
