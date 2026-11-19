@@ -202,9 +202,32 @@ def download_mega_video(share_url: str, destination: Path) -> str:
                 )
             result = client.download_file(url, str(destination), resume=False)
             downloaded_path = Path(result.path) if getattr(result, "path", None) else destination
-            if downloaded_path != destination and downloaded_path.exists():
-                shutil.copy2(downloaded_path, destination)
-            if not destination.exists() or destination.stat().st_size == 0:
+
+            # Some MEGA client versions return the same downloaded file using
+            # a differently-normalized path. Avoid copying a file onto itself.
+            same_file = False
+            try:
+                same_file = downloaded_path.exists() and destination.exists() and os.path.samefile(downloaded_path, destination)
+            except OSError:
+                same_file = False
+            if not same_file and downloaded_path.exists():
+                if downloaded_path.resolve() != destination.resolve():
+                    shutil.copy2(downloaded_path, destination)
+
+            if not destination.is_file() or destination.stat().st_size == 0:
+                # Some versions create the file inside a directory named as
+                # the requested destination; locate the actual downloaded file.
+                candidates = []
+                if downloaded_path.is_file():
+                    candidates.append(downloaded_path)
+                if destination.is_dir():
+                    candidates.extend(p for p in destination.iterdir() if p.is_file())
+                actual = next((p for p in candidates if p.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm"}), None)
+                if actual is None:
+                    raise ValueError("MEGA download finished but the video file could not be located.")
+                if actual.resolve() != destination.resolve():
+                    shutil.copy2(actual, destination)
+            if not destination.is_file() or destination.stat().st_size == 0:
                 raise ValueError("MEGA download finished without creating a video file.")
             if destination.stat().st_size > MAX_UPLOAD_BYTES:
                 raise HTTPException(
