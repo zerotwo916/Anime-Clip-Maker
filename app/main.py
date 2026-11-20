@@ -262,44 +262,6 @@ def get_duration(path: Path) -> float:
         raise HTTPException(status_code=422, detail="Could not determine the video duration.")
 
 
-def parse_ranges(raw: str, duration: float) -> List[Tuple[float, float]]:
-    parsed = []
-    if not raw.strip():
-        return parsed
-    for item in raw.split(","):
-        try:
-            start_text, end_text = item.strip().split("-", 1)
-            start, end = float(start_text.strip()), float(end_text.strip())
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid time range. Use seconds like 80-165, 1320-1410.")
-        if start < 0 or end <= start or end > duration:
-            raise HTTPException(status_code=400, detail=f"Invalid range '{item}'. Start/end must be within the video duration.")
-        parsed.append((start, end))
-    return parsed
-
-
-def merge_ranges(ranges: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    merged = []
-    for start, end in sorted(ranges):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def remaining_segments(duration: float, removed: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    kept = []
-    cursor = 0.0
-    for start, end in removed:
-        if start > cursor:
-            kept.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < duration:
-        kept.append((cursor, duration))
-    return kept
-
-
 def get_preferred_audio_stream(source: Path):
     """Prefer Hindi audio; fall back to the default audio stream, then first audio."""
     result = run_command([
@@ -353,39 +315,6 @@ def detect_scene_boundaries(source: Path) -> List[float]:
         return []
 
 
-
-def detect_op_ed_from_aniskip(mal_id: int, episode_number: int, duration: float) -> List[Tuple[float, float]]:
-    """Fetch community-submitted OP/ED timestamps from AniSkip; no API key required."""
-    url = f"https://api.aniskip.com/v2/skip-times/{mal_id}/{episode_number}"
-    response = requests.get(
-        url,
-        params=[("types", "op"), ("types", "ed"), ("episodeLength", f"{duration:.3f}")],
-        headers={"User-Agent": "AnimeClipMaker/1.0"},
-        timeout=(8, 20),
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("found") or not isinstance(payload.get("results"), list):
-        return []
-
-    ranges: List[Tuple[float, float]] = []
-    for item in payload["results"]:
-        if item.get("skipType") not in {"op", "ed"}:
-            continue
-        interval = item.get("interval") or {}
-        try:
-            start = float(interval["startTime"])
-            end = float(interval["endTime"])
-            reference_length = float(item.get("episodeLength") or duration)
-        except (KeyError, TypeError, ValueError):
-            continue
-        # AniSkip may return a timestamp for a slightly different episode cut.
-        offset = duration - reference_length
-        start = max(0.0, start + offset)
-        end = min(duration, end + offset)
-        if 0 <= start < end <= duration:
-            ranges.append((start, end))
-    return ranges
 
 def build_smart_clip_ranges(
     segments: List[Tuple[float, float]],
@@ -539,8 +468,7 @@ def cleanup_old_jobs():
 
 
 def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
-                clip_seconds: int, selected_formats: list, opening: str, ending: str,
-                auto_op_ed: bool, mal_id: int, episode_number: int):
+                clip_seconds: int, selected_formats: list):
     folder = job_path(job_id)
     try:
         write_job(job_id, status="processing", message="Preparing video…", progress=0)
@@ -563,25 +491,7 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
 
         duration = get_duration(source)
         audio_stream_index = get_preferred_audio_stream(source)
-        opening_ranges = parse_ranges(opening, duration)
-        ending_ranges = parse_ranges(ending, duration)
-        auto_ranges = []
-        op_ed_message = "Automatic OP/ED detection is off."
-        if auto_op_ed:
-            try:
-                auto_ranges = detect_op_ed_from_aniskip(mal_id, episode_number, duration)
-                op_ed_message = (
-                    f"AniSkip found {len(auto_ranges)} OP/ED range(s)."
-                    if auto_ranges else
-                    "AniSkip has no OP/ED timestamps for this anime episode; only manual ranges were used."
-                )
-            except Exception as detection_error:
-                op_ed_message = f"Automatic OP/ED lookup failed; only manual ranges were used ({type(detection_error).__name__})."
-        removed = merge_ranges(opening_ranges + ending_ranges + auto_ranges)
-        write_job(job_id, op_ed_message=op_ed_message)
-        segments = remaining_segments(duration, removed)
-        if not segments:
-            raise HTTPException(status_code=400, detail="The selected ranges remove the entire video.")
+        segments = [(0.0, duration)]
 
         write_job(job_id, message="Detecting scene changes for smarter clip boundaries…", progress=0)
         scene_boundaries = detect_scene_boundaries(source)
@@ -676,16 +586,9 @@ async def create_job(
     mega_url: str = Form(""),
     clip_seconds: int = Form(90),
     formats: str = Form("mp4"),
-    opening: str = Form(""),
-    ending: str = Form(""),
-    auto_op_ed: bool = Form(False),
-    mal_id: int = Form(0),
-    episode_number: int = Form(0),
 ):
     if clip_seconds < 10 or clip_seconds > 3600:
         raise HTTPException(status_code=400, detail="Clip duration must be between 10 and 3600 seconds.")
-    if auto_op_ed and (mal_id < 1 or episode_number < 1):
-        raise HTTPException(status_code=400, detail="For automatic OP/ED detection, enter a valid MyAnimeList ID and episode number.")
     selected_formats = sorted({part.strip().lower() for part in formats.split(",") if part.strip()})
     if not selected_formats or not set(selected_formats).issubset({"mp4", "mkv"}):
         raise HTTPException(status_code=400, detail="Choose MP4, MKV, or both.")
@@ -724,8 +627,7 @@ async def create_job(
 
     background_tasks.add_task(
         process_job, job_id, source_kind, video_url.strip(), mega_url.strip(),
-        clip_seconds, selected_formats, opening, ending, auto_op_ed, mal_id, episode_number
-    )
+        clip_seconds, selected_formats    )
     return {"job_id": job_id, "status": "queued", "message": "Job started."}
 
 
@@ -739,9 +641,7 @@ async def get_job_status(job_id: str):
         "progress": metadata.get("progress", 0),
         "total": metadata.get("total", 0),
         "error": metadata.get("error"),
-        "download_url": metadata.get("download_url"),
-        "op_ed_message": metadata.get("op_ed_message")
-    }
+        "download_url": metadata.get("download_url")    }
 
 
 @app.get("/api/jobs/{job_id}/download")
