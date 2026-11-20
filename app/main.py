@@ -736,7 +736,8 @@ async def get_job_status(job_id: str):
         "progress": metadata.get("progress", 0),
         "total": metadata.get("total", 0),
         "error": metadata.get("error"),
-        "download_url": metadata.get("download_url")
+        "download_url": metadata.get("download_url"),
+        "op_ed_message": metadata.get("op_ed_message")
     }
 
 
