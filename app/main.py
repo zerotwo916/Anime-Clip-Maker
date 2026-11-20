@@ -330,6 +330,65 @@ def get_preferred_audio_stream(source: Path):
     return int(audio_streams[0]["index"])
 
 
+
+def detect_scene_boundaries(source: Path) -> List[float]:
+    """Return video scene-change timestamps in seconds using PySceneDetect."""
+    try:
+        from scenedetect import SceneManager, open_video
+        from scenedetect.detectors import ContentDetector
+
+        video = open_video(str(source))
+        manager = SceneManager()
+        manager.add_detector(ContentDetector(threshold=27.0, min_scene_len=15))
+        manager.detect_scenes(video, show_progress=False)
+        boundaries = []
+        for _scene_start, scene_end in manager.get_scene_list():
+            seconds = float(scene_end.get_seconds())
+            if seconds > 0:
+                boundaries.append(seconds)
+        return sorted(set(boundaries))
+    except Exception:
+        # If scene analysis cannot run on a particular file/server, retain
+        # reliable fixed-duration clipping rather than failing the whole job.
+        return []
+
+
+def build_smart_clip_ranges(
+    segments: List[Tuple[float, float]],
+    target_seconds: int,
+    scene_boundaries: List[float],
+    tolerance_seconds: int = 10,
+) -> List[Tuple[float, float]]:
+    """Cut near the target duration, preferring a nearby detected scene change."""
+    minimum = max(10, target_seconds - tolerance_seconds)
+    maximum = target_seconds + tolerance_seconds
+    clips: List[Tuple[float, float]] = []
+
+    for segment_start, segment_end in segments:
+        cursor = segment_start
+        while segment_end - cursor > maximum:
+            earliest = cursor + minimum
+            latest = min(cursor + maximum, segment_end)
+            candidates = [
+                point for point in scene_boundaries
+                if earliest <= point <= latest
+                and segment_end - point >= minimum
+            ]
+            if candidates:
+                cut = min(candidates, key=lambda point: abs(point - (cursor + target_seconds)))
+            else:
+                cut = cursor + target_seconds
+
+            if cut <= cursor or cut >= segment_end:
+                break
+            clips.append((cursor, cut))
+            cursor = cut
+
+        if segment_end - cursor > 0.05:
+            clips.append((cursor, segment_end))
+
+    return clips
+
 def render_clip(source: Path, start: float, length: float, target: Path,
                 audio_stream_index=None) -> None:
     # Limit encoder parallelism to reduce peak RAM use on small Railway containers.
@@ -476,23 +535,26 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
         if not segments:
             raise HTTPException(status_code=400, detail="The selected ranges remove the entire video.")
 
-        clip_count = 0
-        for segment_start, segment_end in segments:
-            remaining = segment_end - segment_start
-            clip_count += int(remaining // clip_seconds)
-            if remaining % clip_seconds > 0.05:
-                clip_count += 1
+        write_job(job_id, message="Detecting scene changes for smarter clip boundaries…", progress=0)
+        scene_boundaries = detect_scene_boundaries(source)
+        clip_ranges = build_smart_clip_ranges(segments, clip_seconds, scene_boundaries)
+        clip_count = len(clip_ranges)
         if clip_count <= 0:
             raise HTTPException(status_code=400, detail="No clips could be created.")
-        write_job(job_id, message=f"Creating clips (0/{clip_count})…", progress=0, total=clip_count)
+        write_job(
+            job_id,
+            message=f"Creating {clip_count} clips with scene-aware boundaries…",
+            progress=0,
+            total=clip_count,
+            scene_detection="available" if scene_boundaries else "fallback"
+        )
 
         created = []
         clip_index = 1
         completed = 0
-        for segment_start, segment_end in segments:
-            cursor = segment_start
-            while cursor < segment_end - 0.05:
-                clip_length = min(float(clip_seconds), segment_end - cursor)
+        for clip_start, clip_end in clip_ranges:
+                cursor = clip_start
+                clip_length = clip_end - clip_start
                 if len(selected_formats) == 2:
                     # Encode once to MKV, then create the MP4 by stream-copy remux.
                     mkv_output = folder / f"clip_{clip_index:03d}.mkv"
@@ -505,7 +567,6 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
                     output = folder / f"clip_{clip_index:03d}.{extension}"
                     render_clip(source, cursor, clip_length, output, audio_stream_index)
                     created.append(output)
-                cursor += clip_length
                 clip_index += 1
                 completed += 1
                 write_job(job_id, message=f"Creating clips ({completed}/{clip_count})…",
