@@ -511,12 +511,30 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
                 write_job(job_id, message=f"Creating clips ({completed}/{clip_count})…",
                           progress=round(completed * 100 / clip_count), total=clip_count)
 
+        # Video clips are already compressed by FFmpeg. Store them directly rather
+        # than spending CPU recompressing them, then verify the ZIP before exposing it.
         archive = folder / "anime_clips.zip"
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        temporary_archive = folder / "anime_clips.tmp.zip"
+        if not created:
+            raise RuntimeError("No clip files were created.")
+        for output in created:
+            if not output.is_file() or output.stat().st_size == 0:
+                raise RuntimeError(f"Clip output is missing or empty: {output.name}")
+        with zipfile.ZipFile(
+            temporary_archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True
+        ) as zip_file:
             for output in created:
                 zip_file.write(output, arcname=output.name)
+        with zipfile.ZipFile(temporary_archive, "r") as zip_file:
+            bad_file = zip_file.testzip()
+            if bad_file is not None:
+                raise RuntimeError(f"ZIP integrity check failed for: {bad_file}")
+        if temporary_archive.stat().st_size == 0:
+            raise RuntimeError("The ZIP archive was created but is empty.")
+        temporary_archive.replace(archive)
         write_job(job_id, status="completed", message="Clips are ready to download.",
-                  progress=100, total=clip_count, download_url=f"/api/jobs/{job_id}/download")
+                  progress=100, total=clip_count, download_url=f"/api/jobs/{job_id}/download",
+                  archive_size=archive.stat().st_size, clip_files=len(created))
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc) or "Unknown processing error."
         diagnostic = (
