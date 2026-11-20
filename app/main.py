@@ -262,6 +262,44 @@ def get_duration(path: Path) -> float:
         raise HTTPException(status_code=422, detail="Could not determine the video duration.")
 
 
+def parse_ranges(raw: str, duration: float) -> List[Tuple[float, float]]:
+    parsed = []
+    if not raw.strip():
+        return parsed
+    for item in raw.split(","):
+        try:
+            start_text, end_text = item.strip().split("-", 1)
+            start, end = float(start_text.strip()), float(end_text.strip())
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid time range. Use seconds like 80-165, 1320-1410.")
+        if start < 0 or end <= start or end > duration:
+            raise HTTPException(status_code=400, detail=f"Invalid range '{item}'. Start/end must be within the video duration.")
+        parsed.append((start, end))
+    return parsed
+
+
+def merge_ranges(ranges: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def remaining_segments(duration: float, removed: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    kept = []
+    cursor = 0.0
+    for start, end in removed:
+        if start > cursor:
+            kept.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < duration:
+        kept.append((cursor, duration))
+    return kept
+
+
 def get_preferred_audio_stream(source: Path):
     """Prefer Hindi audio; fall back to the default audio stream, then first audio."""
     result = run_command([
@@ -468,7 +506,7 @@ def cleanup_old_jobs():
 
 
 def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
-                clip_seconds: int, selected_formats: list):
+                clip_seconds: int, selected_formats: list, opening: str, ending: str):
     folder = job_path(job_id)
     try:
         write_job(job_id, status="processing", message="Preparing video…", progress=0)
@@ -491,7 +529,12 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
 
         duration = get_duration(source)
         audio_stream_index = get_preferred_audio_stream(source)
-        segments = [(0.0, duration)]
+        opening_ranges = parse_ranges(opening, duration)
+        ending_ranges = parse_ranges(ending, duration)
+        removed = merge_ranges(opening_ranges + ending_ranges)
+        segments = remaining_segments(duration, removed)
+        if not segments:
+            raise HTTPException(status_code=400, detail="The selected ranges remove the entire video.")
 
         write_job(job_id, message="Detecting scene changes for smarter clip boundaries…", progress=0)
         scene_boundaries = detect_scene_boundaries(source)
@@ -586,6 +629,8 @@ async def create_job(
     mega_url: str = Form(""),
     clip_seconds: int = Form(90),
     formats: str = Form("mp4"),
+    opening: str = Form(""),
+    ending: str = Form(""),
 ):
     if clip_seconds < 10 or clip_seconds > 3600:
         raise HTTPException(status_code=400, detail="Clip duration must be between 10 and 3600 seconds.")
@@ -627,7 +672,8 @@ async def create_job(
 
     background_tasks.add_task(
         process_job, job_id, source_kind, video_url.strip(), mega_url.strip(),
-        clip_seconds, selected_formats    )
+        clip_seconds, selected_formats, opening, ending
+    )
     return {"job_id": job_id, "status": "queued", "message": "Job started."}
 
 
