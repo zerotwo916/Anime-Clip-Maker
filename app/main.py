@@ -539,7 +539,8 @@ def cleanup_old_jobs():
 
 
 def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
-                clip_seconds: int, selected_formats: list, opening: str, ending: str):
+                clip_seconds: int, selected_formats: list, opening: str, ending: str,
+                auto_op_ed: bool, mal_id: int, episode_number: int):
     folder = job_path(job_id)
     try:
         write_job(job_id, status="processing", message="Preparing video…", progress=0)
@@ -677,7 +678,9 @@ async def create_job(
     formats: str = Form("mp4"),
     opening: str = Form(""),
     ending: str = Form(""),
-    
+    auto_op_ed: bool = Form(False),
+    mal_id: int = Form(0),
+    episode_number: int = Form(0),
 ):
     if clip_seconds < 10 or clip_seconds > 3600:
         raise HTTPException(status_code=400, detail="Clip duration must be between 10 and 3600 seconds.")
@@ -721,7 +724,7 @@ async def create_job(
 
     background_tasks.add_task(
         process_job, job_id, source_kind, video_url.strip(), mega_url.strip(),
-        clip_seconds, selected_formats, opening, ending
+        clip_seconds, selected_formats, opening, ending, auto_op_ed, mal_id, episode_number
     )
     return {"job_id": job_id, "status": "queued", "message": "Job started."}
 
