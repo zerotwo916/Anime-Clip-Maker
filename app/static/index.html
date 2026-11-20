@@ -106,7 +106,7 @@ async function checkJob(jobId){
   }
   const job=await response.json();
   if(job.status==='completed'){
-   statusBox.textContent='Finished! Your clips are ready. Tap Download ZIP to save them.'+(job.op_ed_message?'\\n'+job.op_ed_message:'');
+   statusBox.textContent='Finished! Your clips are ready. Tap Download ZIP to save them.'+(job.op_ed_message?'\n'+job.op_ed_message:'');
    showDownload(jobId);
    clearPolling();
    setBusy(false);
@@ -139,7 +139,11 @@ form.addEventListener('submit',async event=>{
  const data=new FormData(form);
  const file=document.getElementById('video').files[0];
  const link=document.getElementById('video_url').value.trim();
- const megaLink=document.getElementById('mega_url').value.trim();\n const autoOpEd=document.getElementById('auto_op_ed').checked;\n const malId=document.getElementById('mal_id').value.trim();\n const episodeNumber=document.getElementById('episode_number').value.trim();\n if(autoOpEd && (!malId || !episodeNumber)){statusBox.textContent='Enter the MyAnimeList ID and episode number to use automatic OP/ED removal.';return;}
+ const megaLink=document.getElementById('mega_url').value.trim();
+ const autoOpEd=document.getElementById('auto_op_ed').checked;
+ const malId=document.getElementById('mal_id').value.trim();
+ const episodeNumber=document.getElementById('episode_number').value.trim();
+ if(autoOpEd && (!malId || !episodeNumber)){statusBox.textContent='Enter the MyAnimeList ID and episode number to use automatic OP/ED removal.';return;}
  if([Boolean(file),Boolean(link),Boolean(megaLink)].filter(Boolean).length!==1){
   statusBox.textContent='Choose exactly one source: a video file, a Gofile link, or a MEGA link.';
   return;
