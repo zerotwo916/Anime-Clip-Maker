@@ -267,8 +267,22 @@ def detect_op_ed_with_gemini(source: Path, duration: float):
 
     client = genai.Client(api_key=api_key)
     uploaded = None
+    ai_input = source
+    converted_input = None
     try:
-        uploaded = client.files.upload(file=str(source))
+        if source.suffix.lower() == ".mkv" or not source.suffix:
+            converted_input = source.with_name(source.stem + "_gemini.mp4")
+            run_command([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-threads", "2", "-i", str(source),
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-vf", "scale='min(854,iw)':-2",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                "-threads", "2", "-c:a", "aac", "-b:a", "64k", "-ac", "1",
+                "-movflags", "+faststart", str(converted_input)
+            ])
+            ai_input = converted_input
+        uploaded = client.files.upload(file=str(ai_input))
         deadline = time.time() + 900
         while True:
             state = getattr(uploaded, "state", None)
@@ -334,6 +348,8 @@ and {duration:.2f}, and end must be greater than start.
                 client.files.delete(name=uploaded.name)
             except Exception:
                 pass
+        if converted_input is not None:
+            converted_input.unlink(missing_ok=True)
 
 
 def get_duration(path: Path) -> float:
@@ -551,7 +567,8 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
             source = folder / ("source" + suffix)
             downloaded_file.replace(source)
         else:
-            source = folder / "source_upload"
+            upload_candidates = list(folder.glob("source_upload.*"))
+            source = upload_candidates[0] if upload_candidates else folder / "source_upload"
             if not source.is_file() or source.stat().st_size == 0:
                 raise HTTPException(status_code=422, detail="Uploaded video is missing or empty.")
 
@@ -681,7 +698,7 @@ async def create_job(
             shutil.rmtree(folder, ignore_errors=True)
             raise HTTPException(status_code=422, detail="Unsupported video format.")
         try:
-            await save_upload(file, folder / "source_upload")
+            await save_upload(file, folder / f"source_upload{suffix}")
         except Exception:
             shutil.rmtree(folder, ignore_errors=True)
             raise
