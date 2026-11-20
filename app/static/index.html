@@ -106,7 +106,7 @@ async function checkJob(jobId){
   }
   const job=await response.json();
   if(job.status==='completed'){
-   statusBox.textContent='Finished! Your clips are ready. Tap Download ZIP to save them.';
+   statusBox.textContent='Finished! Your clips are ready. Tap Download ZIP to save them.'+(job.op_ed_message?'\\n'+job.op_ed_message:'');
    showDownload(jobId);
    clearPolling();
    setBusy(false);
