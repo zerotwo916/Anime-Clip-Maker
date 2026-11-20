@@ -353,6 +353,40 @@ def detect_scene_boundaries(source: Path) -> List[float]:
         return []
 
 
+
+def detect_op_ed_from_aniskip(mal_id: int, episode_number: int, duration: float) -> List[Tuple[float, float]]:
+    """Fetch community-submitted OP/ED timestamps from AniSkip; no API key required."""
+    url = f"https://api.aniskip.com/v2/skip-times/{mal_id}/{episode_number}"
+    response = requests.get(
+        url,
+        params=[("types", "op"), ("types", "ed"), ("episodeLength", f"{duration:.3f}")],
+        headers={"User-Agent": "AnimeClipMaker/1.0"},
+        timeout=(8, 20),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("found") or not isinstance(payload.get("results"), list):
+        return []
+
+    ranges: List[Tuple[float, float]] = []
+    for item in payload["results"]:
+        if item.get("skipType") not in {"op", "ed"}:
+            continue
+        interval = item.get("interval") or {}
+        try:
+            start = float(interval["startTime"])
+            end = float(interval["endTime"])
+            reference_length = float(item.get("episodeLength") or duration)
+        except (KeyError, TypeError, ValueError):
+            continue
+        # AniSkip may return a timestamp for a slightly different episode cut.
+        offset = duration - reference_length
+        start = max(0.0, start + offset)
+        end = min(duration, end + offset)
+        if 0 <= start < end <= duration:
+            ranges.append((start, end))
+    return ranges
+
 def build_smart_clip_ranges(
     segments: List[Tuple[float, float]],
     target_seconds: int,
@@ -530,7 +564,20 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
         audio_stream_index = get_preferred_audio_stream(source)
         opening_ranges = parse_ranges(opening, duration)
         ending_ranges = parse_ranges(ending, duration)
-        removed = merge_ranges(opening_ranges + ending_ranges)
+        auto_ranges = []
+        op_ed_message = "Automatic OP/ED detection is off."
+        if auto_op_ed:
+            try:
+                auto_ranges = detect_op_ed_from_aniskip(mal_id, episode_number, duration)
+                op_ed_message = (
+                    f"AniSkip found {len(auto_ranges)} OP/ED range(s)."
+                    if auto_ranges else
+                    "AniSkip has no OP/ED timestamps for this anime episode; only manual ranges were used."
+                )
+            except Exception as detection_error:
+                op_ed_message = f"Automatic OP/ED lookup failed; only manual ranges were used ({type(detection_error).__name__})."
+        removed = merge_ranges(opening_ranges + ending_ranges + auto_ranges)
+        write_job(job_id, op_ed_message=op_ed_message)
         segments = remaining_segments(duration, removed)
         if not segments:
             raise HTTPException(status_code=400, detail="The selected ranges remove the entire video.")
@@ -634,6 +681,8 @@ async def create_job(
 ):
     if clip_seconds < 10 or clip_seconds > 3600:
         raise HTTPException(status_code=400, detail="Clip duration must be between 10 and 3600 seconds.")
+    if auto_op_ed and (mal_id < 1 or episode_number < 1):
+        raise HTTPException(status_code=400, detail="For automatic OP/ED detection, enter a valid MyAnimeList ID and episode number.")
     selected_formats = sorted({part.strip().lower() for part in formats.split(",") if part.strip()})
     if not selected_formats or not set(selected_formats).issubset({"mp4", "mkv"}):
         raise HTTPException(status_code=400, detail="Choose MP4, MKV, or both.")
