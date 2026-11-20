@@ -37,22 +37,6 @@ button:disabled{opacity:.55}.hint{color:#9da8bf;font-size:13px}
 <div><label for="formats">Output format</label><select id="formats"><option value="mp4">MP4</option><option value="mkv">MKV</option><option value="mp4,mkv">Both (ZIP)</option></select></div>
 </div>
 <div class="notice"><strong>Smart scene-based clipping is enabled.</strong><br>Clip duration is the target. The app checks for a nearby scene change and may extend or shorten each clip by up to 10 seconds (for example, a 90-second target can end around 80–100 seconds) to avoid cutting during a visual scene transition. This detects visual cuts, not spoken sentence endings.</div>
-<div class="notice">
-<strong>Automatic OP/ED removal (optional)</strong><br>
-This uses free community timestamps from AniSkip, not an AI model. It needs the MyAnimeList (MAL) anime ID and episode number. If no verified timestamps are available, the app keeps the episode content and uses only your manual ranges.
-</div>
-<label><input id="auto_op_ed" type="checkbox" name="auto_op_ed" value="true"> Automatically detect and remove OP/ED</label>
-<div class="grid">
-<div><label for="mal_id">MyAnimeList ID</label><input id="mal_id" name="mal_id" type="number" min="1" placeholder="Example: 1"></div>
-<div><label for="episode_number">Episode number</label><input id="episode_number" name="episode_number" type="number" min="1" placeholder="Example: 4"></div>
-</div>
-<p class="hint">MAL ID is the number in the anime's MyAnimeList URL. Automatic removal only uses OP/ED timestamps returned for that exact anime and episode.</p>
-<label for="opening">Opening ranges (optional)</label>
-<input id="opening" name="opening" placeholder="Example: 80-165, 900-985">
-<p class="hint">Enter start-end times in seconds. Separate multiple ranges with commas. Separate multiple ranges with commas.</p>
-<label for="ending">Ending ranges (optional)</label>
-<input id="ending" name="ending" placeholder="Example: 1320-1410">
-<p class="hint">Only the ranges entered above are removed. Leave blank to keep that section.</p>
 <button id="submit" type="submit">Create Clips</button>
 </form>
 <div id="status" role="status" aria-live="polite"></div>
@@ -106,7 +90,7 @@ async function checkJob(jobId){
   }
   const job=await response.json();
   if(job.status==='completed'){
-   statusBox.textContent='Finished! Your clips are ready. Tap Download ZIP to save them.'+(job.op_ed_message?'\n'+job.op_ed_message:'');
+   statusBox.textContent='Finished! Your clips are ready. Tap Download ZIP to save them.';
    showDownload(jobId);
    clearPolling();
    setBusy(false);
@@ -140,16 +124,10 @@ form.addEventListener('submit',async event=>{
  const file=document.getElementById('video').files[0];
  const link=document.getElementById('video_url').value.trim();
  const megaLink=document.getElementById('mega_url').value.trim();
- const autoOpEd=document.getElementById('auto_op_ed').checked;
- const malId=document.getElementById('mal_id').value.trim();
- const episodeNumber=document.getElementById('episode_number').value.trim();
- if(autoOpEd && (!malId || !episodeNumber)){statusBox.textContent='Enter the MyAnimeList ID and episode number to use automatic OP/ED removal.';return;}
  if([Boolean(file),Boolean(link),Boolean(megaLink)].filter(Boolean).length!==1){
   statusBox.textContent='Choose exactly one source: a video file, a Gofile link, or a MEGA link.';
   return;
  }
- if(!data.get('mal_id')) data.set('mal_id','0');
- if(!data.get('episode_number')) data.set('episode_number','0');
  data.set('formats',document.getElementById('formats').value);
  setBusy(true);
  clearPolling();
