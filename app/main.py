@@ -299,15 +299,46 @@ def remaining_segments(duration: float, removed: List[Tuple[float, float]]) -> L
     return kept
 
 
-def render_clip(source: Path, start: float, length: float, target: Path) -> None:
+def get_preferred_audio_stream(source: Path):
+    """Prefer Hindi audio; fall back to the default audio stream, then first audio."""
+    result = run_command([
+        "ffprobe", "-v", "error", "-show_entries",
+        "stream=index,codec_type:stream_tags=language,title:stream_disposition=default",
+        "-of", "json", str(source)
+    ])
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (ValueError, TypeError):
+        streams = []
+
+    audio_streams = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    if not audio_streams:
+        return None
+
+    for stream in audio_streams:
+        tags = stream.get("tags") or {}
+        language = str(tags.get("language", "")).strip().lower()
+        title = str(tags.get("title", "")).strip().lower()
+        if language in {"hin", "hi", "hindi"} or "hindi" in title:
+            return int(stream["index"])
+
+    for stream in audio_streams:
+        if (stream.get("disposition") or {}).get("default") == 1:
+            return int(stream["index"])
+
+    return int(audio_streams[0]["index"])
+
+
+def render_clip(source: Path, start: float, length: float, target: Path,
+                audio_stream_index=None) -> None:
     # Limit encoder parallelism to reduce peak RAM use on small Railway containers.
-    # "ultrafast" avoids expensive motion estimation and is substantially lighter
-    # than superfast; CRF 20 preserves the configured quality target.
+    # Keep only the preferred Hindi audio stream when one is available.
+    audio_map = ["-map", f"0:{audio_stream_index}"] if audio_stream_index is not None else ["-map", "0:a?"]
     run_command([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-threads", "2",
         "-ss", f"{start:.3f}", "-i", str(source), "-t", f"{length:.3f}",
-        "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn",
+        "-map", "0:v:0", *audio_map, "-sn", "-dn",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
         "-threads", "2",
         "-c:a", "aac", "-b:a", "128k", "-threads:a", "1",
@@ -435,6 +466,7 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
                 raise HTTPException(status_code=422, detail="Uploaded video is missing or empty.")
 
         duration = get_duration(source)
+        audio_stream_index = get_preferred_audio_stream(source)
         removed = merge_ranges(parse_ranges(opening, duration) + parse_ranges(ending, duration))
         segments = remaining_segments(duration, removed)
         if not segments:
@@ -461,13 +493,13 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
                     # Encode once to MKV, then create the MP4 by stream-copy remux.
                     mkv_output = folder / f"clip_{clip_index:03d}.mkv"
                     mp4_output = folder / f"clip_{clip_index:03d}.mp4"
-                    render_clip(source, cursor, clip_length, mkv_output)
+                    render_clip(source, cursor, clip_length, mkv_output, audio_stream_index)
                     remux_clip(mkv_output, mp4_output)
                     created.extend([mp4_output, mkv_output])
                 else:
                     extension = selected_formats[0]
                     output = folder / f"clip_{clip_index:03d}.{extension}"
-                    render_clip(source, cursor, clip_length, output)
+                    render_clip(source, cursor, clip_length, output, audio_stream_index)
                     created.append(output)
                 cursor += clip_length
                 clip_index += 1
