@@ -37,6 +37,12 @@ button:disabled{opacity:.55}.hint{color:#9da8bf;font-size:13px}
 <div><label for="formats">Output format</label><select id="formats"><option value="mp4">MP4</option><option value="mkv">MKV</option><option value="mp4,mkv">Both (ZIP)</option></select></div>
 </div>
 <div class="notice"><strong>Smart scene-based clipping is enabled.</strong><br>Clip duration is the target. The app checks for a nearby scene change and may extend or shorten each clip by up to 10 seconds (for example, a 90-second target can end around 80–100 seconds) to avoid cutting during a visual scene transition. This detects visual cuts, not spoken sentence endings.</div>
+<label for="opening">Opening ranges (optional)</label>
+<input id="opening" name="opening" placeholder="Example: 80-165, 900-985">
+<p class="hint">Enter start-end times in seconds. Separate multiple ranges with commas. Leave blank to keep the opening.</p>
+<label for="ending">Ending ranges (optional)</label>
+<input id="ending" name="ending" placeholder="Example: 1320-1410">
+<p class="hint">Leave blank to keep the ending.</p>
 <button id="submit" type="submit">Create Clips</button>
 </form>
 <div id="status" role="status" aria-live="polite"></div>
