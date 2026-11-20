@@ -148,6 +148,8 @@ form.addEventListener('submit',async event=>{
   statusBox.textContent='Choose exactly one source: a video file, a Gofile link, or a MEGA link.';
   return;
  }
+ if(!data.get('mal_id')) data.set('mal_id','0');
+ if(!data.get('episode_number')) data.set('episode_number','0');
  data.set('formats',document.getElementById('formats').value);
  setBusy(true);
  clearPolling();
