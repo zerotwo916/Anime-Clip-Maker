@@ -37,7 +37,9 @@ button:disabled{opacity:.55}.hint{color:#9da8bf;font-size:13px}
 <div><label for="clip_seconds">Clip duration (seconds)</label><input id="clip_seconds" type="number" name="clip_seconds" min="10" max="3600" value="90" required></div>
 <div><label for="formats">Output format</label><select id="formats"><option value="mp4">MP4</option><option value="mkv">MKV</option><option value="mp4,mkv">Both (ZIP)</option></select></div>
 </div>
-<label><input id="auto_detect" type="checkbox" name="auto_detect" value="true"> Automatically detect OP and ED with Gemini AI</label>\n<p class="hint">AI analysis sends the video to Google Gemini for processing. Gemini API usage may incur charges and is subject to Google limits. If disabled, only your manual time ranges are used.</p>\n<label for="opening">Opening ranges (optional)</label>
+<label><input id="auto_detect" type="checkbox" name="auto_detect" value="true"> Automatically detect OP and ED with Gemini AI</label>
+<p class="hint">AI analysis sends the video to Google Gemini for processing. Gemini API usage may incur charges and is subject to Google limits. If disabled, only your manual time ranges are used.</p>
+<label for="opening">Opening ranges (optional)</label>
 <input id="opening" name="opening" placeholder="Example: 80-165, 900-985">
 <p class="hint">Enter start-end times in seconds. Separate multiple ranges with commas. Manual ranges are combined with AI-detected ranges.</p>
 <label for="ending">Ending ranges (optional)</label>
