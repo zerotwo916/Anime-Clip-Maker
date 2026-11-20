@@ -248,110 +248,6 @@ def download_mega_video(share_url: str, destination: Path) -> str:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
 
-def detect_op_ed_with_gemini(source: Path, duration: float):
-    """Ask Gemini to identify opening and ending sequences in the episode."""
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="AI detection needs GEMINI_API_KEY. Add it to Railway Variables, then redeploy."
-        )
-
-    try:
-        from google import genai
-    except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail="Gemini SDK is missing. Check the google-genai dependency and redeploy."
-        )
-
-    client = genai.Client(api_key=api_key)
-    uploaded = None
-    ai_input = source
-    converted_input = None
-    try:
-        if source.suffix.lower() == ".mkv" or not source.suffix:
-            converted_input = source.with_name(source.stem + "_gemini.mp4")
-            run_command([
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-threads", "2", "-i", str(source),
-                "-map", "0:v:0", "-map", "0:a:0?",
-                "-vf", "scale='min(854,iw)':-2",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
-                "-threads", "2", "-c:a", "aac", "-b:a", "64k", "-ac", "1",
-                "-movflags", "+faststart", str(converted_input)
-            ])
-            ai_input = converted_input
-        uploaded = client.files.upload(file=str(ai_input))
-        deadline = time.time() + 900
-        while True:
-            state = getattr(uploaded, "state", None)
-            state_name = getattr(state, "name", str(state or "")).upper()
-            if state_name == "ACTIVE":
-                break
-            if state_name == "FAILED":
-                raise ValueError("Gemini could not process this video file.")
-            if time.time() >= deadline:
-                raise TimeoutError("Gemini video processing took too long (15-minute limit).")
-            time.sleep(5)
-            uploaded = client.files.get(name=uploaded.name)
-
-        prompt = f"""
-You are analyzing one anime episode with duration {duration:.2f} seconds.
-Identify only the actual recurring anime opening theme sequence (OP) and ending theme
-sequence (ED), including their full visual/music sequences. Do not classify a recap,
-preview, eyecatch, ordinary scene, or next-episode preview as OP/ED.
-Return ONLY valid JSON, with this exact structure:
-{{
-  "opening": [{{"start": 0.0, "end": 90.0}}],
-  "ending": [{{"start": 1200.0, "end": 1290.0}}]
-}}
-Use seconds from the beginning of the video. Include an empty array when a section
-is absent. Return at most one opening and one ending range. Be conservative:
-if uncertain, omit the range rather than guessing. All times must be between 0
-and {duration:.2f}, and end must be greater than start.
-"""
-        response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
-            contents=[uploaded, prompt],
-        )
-        raw = (getattr(response, "text", None) or "").strip()
-        match = re.search(r"\{[\s\S]*\}", raw)
-        if not match:
-            raise ValueError("Gemini did not return valid JSON for OP/ED timestamps.")
-        data = json.loads(match.group(0))
-
-        def checked_ranges(key):
-            values = data.get(key, [])
-            if not isinstance(values, list):
-                raise ValueError(f"Gemini returned an invalid {key} range list.")
-            checked = []
-            for item in values[:1]:
-                start = float(item["start"])
-                end = float(item["end"])
-                if start < 0 or end <= start or end > duration:
-                    continue
-                checked.append((start, end))
-            return checked
-
-        return checked_ranges("opening"), checked_ranges("ending")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini OP/ED detection failed: {type(exc).__name__}: {exc}"
-        )
-    finally:
-        if uploaded is not None:
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
-        if converted_input is not None:
-            converted_input.unlink(missing_ok=True)
-
-
 def get_duration(path: Path) -> float:
     result = run_command([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -550,8 +446,7 @@ def cleanup_old_jobs():
 
 
 def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
-                clip_seconds: int, selected_formats: list, opening: str, ending: str,
-                auto_detect: bool):
+                clip_seconds: int, selected_formats: list, opening: str, ending: str):
     folder = job_path(job_id)
     try:
         write_job(job_id, status="processing", message="Preparing video…", progress=0)
@@ -576,13 +471,6 @@ def process_job(job_id: str, source_kind: str, video_url: str, mega_url: str,
         audio_stream_index = get_preferred_audio_stream(source)
         opening_ranges = parse_ranges(opening, duration)
         ending_ranges = parse_ranges(ending, duration)
-        if auto_detect:
-            write_job(job_id, message="AI is analyzing the episode for OP/ED…", progress=2)
-            ai_opening, ai_ending = detect_op_ed_with_gemini(source, duration)
-            opening_ranges.extend(ai_opening)
-            ending_ranges.extend(ai_ending)
-            detected_text = f"AI detected {len(ai_opening)} OP and {len(ai_ending)} ED range(s)."
-            write_job(job_id, message=detected_text, progress=5)
         removed = merge_ranges(opening_ranges + ending_ranges)
         segments = remaining_segments(duration, removed)
         if not segments:
@@ -663,10 +551,8 @@ async def create_job(
     formats: str = Form("mp4"),
     opening: str = Form(""),
     ending: str = Form(""),
-    auto_detect: bool = Form(False)
+    
 ):
-    if auto_detect and not os.getenv("GEMINI_API_KEY", "").strip():
-        raise HTTPException(status_code=400, detail="AI detection is enabled, but GEMINI_API_KEY is not set in Railway Variables.")
     if clip_seconds < 10 or clip_seconds > 3600:
         raise HTTPException(status_code=400, detail="Clip duration must be between 10 and 3600 seconds.")
     selected_formats = sorted({part.strip().lower() for part in formats.split(",") if part.strip()})
@@ -707,7 +593,7 @@ async def create_job(
 
     background_tasks.add_task(
         process_job, job_id, source_kind, video_url.strip(), mega_url.strip(),
-        clip_seconds, selected_formats, opening, ending, auto_detect
+        clip_seconds, selected_formats, opening, ending
     )
     return {"job_id": job_id, "status": "queued", "message": "Job started."}
 
